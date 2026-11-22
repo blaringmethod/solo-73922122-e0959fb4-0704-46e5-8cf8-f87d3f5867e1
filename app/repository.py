@@ -26,6 +26,10 @@ class ConflictError(Exception):
     """Same version number, different content."""
 
 
+class PackageNotFoundError(Exception):
+    """A statistics query named a version that was never ingested."""
+
+
 @dataclass(frozen=True)
 class Box:
     row_start: int
@@ -127,8 +131,8 @@ def ingest(conn: sqlite3.Connection, package: Package) -> dict:
         conn.execute(
             """
             INSERT INTO packages
-                (version, digest, r0, r1, c0, c1, wet_count, imported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (version, digest, r0, r1, c0, c1, wet_count, imported_at, historical)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
             (
                 package.version,
@@ -151,6 +155,16 @@ def ingest(conn: sqlite3.Connection, package: Package) -> dict:
                 coverage.col_start,
                 coverage.col_end,
             ),
+        )
+
+        # Archive the package's own reported points together with the ingest,
+        # in the same transaction.  Every reported point is kept, including
+        # ones a higher version has already covered; the archive is what makes
+        # historical statistics for new packages an exact answer.
+        conn.executemany(
+            "INSERT INTO package_wet_archive (package_version, row, col) "
+            "VALUES (?, ?, ?)",
+            [(package.version, row, col) for row, col in package.wet_cells],
         )
 
         # This package now owns the whole rectangle.  Any current wet cell in
@@ -335,7 +349,7 @@ def cell_status(conn: sqlite3.Connection, row: int, col: int) -> dict:
 def list_packages(conn: sqlite3.Connection) -> dict:
     rows = conn.execute(
         """
-        SELECT version, digest, r0, r1, c0, c1, wet_count, imported_at
+        SELECT version, digest, r0, r1, c0, c1, wet_count, historical, imported_at
         FROM packages
         ORDER BY version DESC
         """
@@ -343,6 +357,11 @@ def list_packages(conn: sqlite3.Connection) -> dict:
     current_counts = dict(
         conn.execute(
             "SELECT version, COUNT(*) FROM current_wet GROUP BY version"
+        ).fetchall()
+    )
+    archive_counts = dict(
+        conn.execute(
+            "SELECT package_version, COUNT(*) FROM package_wet_archive GROUP BY package_version"
         ).fetchall()
     )
     total_current_wet = sum(current_counts.values())
@@ -359,10 +378,316 @@ def list_packages(conn: sqlite3.Connection) -> dict:
                 },
                 "listed_wet_points": r["wet_count"],
                 "current_wet_points": current_counts.get(r["version"], 0),
+                "archived_wet_points": archive_counts.get(r["version"], 0),
+                "historical": bool(r["historical"]),
                 "imported_at": r["imported_at"],
             }
             for r in rows
         ],
         "max_version": _max_version(conn),
         "total_current_wet": total_current_wet,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Historical box statistics
+# ---------------------------------------------------------------------------
+
+
+def _intersect(
+    a_r0: int, a_r1: int, a_c0: int, a_c1: int, box: Box
+) -> tuple[int, int, int, int] | None:
+    """Intersection of a rectangle with ``box``; ``None`` when they do not meet."""
+    r0 = max(a_r0, box.row_start)
+    r1 = min(a_r1, box.row_end)
+    c0 = max(a_c0, box.col_start)
+    c1 = min(a_c1, box.col_end)
+    if r0 < r1 and c0 < c1:
+        return r0, r1, c0, c1
+    return None
+
+
+def union_area(rects: list[tuple[int, int, int, int]]) -> int:
+    """Area of the union of axis-aligned half-open rectangles.
+
+    Rectangles stay rectangles all the way: a sweep line merges column
+    intervals per row band, so coverage spanning millions of cells is never
+    expanded into individual cells.
+    """
+    if not rects:
+        return 0
+    edges: list[tuple[int, int, int, int]] = []
+    for r0, r1, c0, c1 in rects:
+        edges.append((r0, 1, c0, c1))
+        edges.append((r1, -1, c0, c1))
+    edges.sort(key=lambda e: (e[0], e[1]))
+
+    def merged_span(intervals: list[tuple[int, int]]) -> int:
+        if not intervals:
+            return 0
+        ordered = sorted(intervals)
+        span = 0
+        lo, hi = ordered[0]
+        for c0, c1 in ordered[1:]:
+            if c0 <= hi:
+                hi = max(hi, c1)
+            else:
+                span += hi - lo
+                lo, hi = c0, c1
+        return span + (hi - lo)
+
+    active: list[tuple[int, int]] = []
+    total = 0
+    prev_row = edges[0][0]
+    for row, kind, c0, c1 in edges:
+        if row > prev_row:
+            total += (row - prev_row) * merged_span(active)
+            prev_row = row
+        if kind == 1:
+            active.append((c0, c1))
+        else:
+            active.remove((c0, c1))
+    return total
+
+
+def _unknown_rects(
+    conn: sqlite3.Connection, version: int
+) -> list[tuple[int, int, int, int]]:
+    rows = conn.execute(
+        "SELECT r0, r1, c0, c1 FROM package_unknown_rects WHERE package_version = ?",
+        (version,),
+    ).fetchall()
+    return [(r["r0"], r["r1"], r["c0"], r["c1"]) for r in rows]
+
+
+def _archived_cells(
+    conn: sqlite3.Connection, version: int, box: Box, limit: int
+) -> tuple[list[dict], bool]:
+    rows = conn.execute(
+        """
+        SELECT row, col FROM package_wet_archive
+        WHERE package_version = ?
+          AND row >= ? AND row < ?
+          AND col >= ? AND col < ?
+        ORDER BY row, col
+        LIMIT ?
+        """,
+        (
+            version,
+            box.row_start,
+            box.row_end,
+            box.col_start,
+            box.col_end,
+            limit + 1,
+        ),
+    ).fetchall()
+    truncated = len(rows) > limit
+    return (
+        [{"row": r["row"], "col": r["col"]} for r in rows[:limit]],
+        truncated,
+    )
+
+
+def historical_box_statistics(
+    conn: sqlite3.Connection, version: int, box: Box, point_limit: int
+) -> dict:
+    """Possible wet-cell count of one package inside a work-area rectangle.
+
+    New packages (ingested after the upgrade) keep every reported point in the
+    archive, so the answer is exact.  Historical packages only retain the
+    dry/wet verdicts that were knowable at upgrade time: cells then covered by
+    a higher version are unknown, and the package's original reported total
+    bounds how many wet cells can still hide among them.
+    """
+    package = conn.execute(
+        "SELECT r0, r1, c0, c1, wet_count, historical FROM packages WHERE version = ?",
+        (version,),
+    ).fetchone()
+    if package is None:
+        raise PackageNotFoundError(f"版号 {version} 尚未入仓。")
+
+    overlap = _intersect(
+        package["r0"], package["r1"], package["c0"], package["c1"], box
+    )
+    listed_total = package["wet_count"]
+    if overlap is None:
+        return _statistics_payload(
+            version=version,
+            box=box,
+            overlap=None,
+            historical=bool(package["historical"]),
+            listed_total=listed_total,
+            min_wet=0,
+            max_wet=0,
+            unknown_area=0,
+            known_dry=0,
+            known_wet=0,
+            unknown_rects=[],
+            archived=[],
+            archived_truncated=False,
+        )
+
+    overlap_box = Box(*overlap)
+    overlap_area = overlap_box.area
+    archived, archived_truncated = _archived_cells(
+        conn, version, overlap_box, point_limit
+    )
+
+    def archived_count(within: Box) -> int:
+        return conn.execute(
+            """
+            SELECT COUNT(*) FROM package_wet_archive
+            WHERE package_version = ?
+              AND row >= ? AND row < ?
+              AND col >= ? AND col < ?
+            """,
+            (
+                version,
+                within.row_start,
+                within.row_end,
+                within.col_start,
+                within.col_end,
+            ),
+        ).fetchone()[0]
+
+    if not package["historical"]:
+        # Full archive: every reported point survived, so the count is exact
+        # even if a higher version had already covered this package at ingest.
+        exact_count = archived_count(overlap_box)
+        return _statistics_payload(
+            version=version,
+            box=box,
+            overlap=overlap_box,
+            historical=False,
+            listed_total=listed_total,
+            min_wet=exact_count,
+            max_wet=exact_count,
+            unknown_area=0,
+            known_dry=overlap_area - exact_count,
+            known_wet=exact_count,
+            unknown_rects=[],
+            archived=archived,
+            archived_truncated=archived_truncated,
+        )
+
+    # Historical package.  The unknown region is the frozen union of the
+    # higher-version coverage clipped to this package's rectangle.
+    frozen_unknown = _unknown_rects(conn, version)
+    unknown_in_overlap = [
+        rect
+        for rect in (
+            _intersect(r0, r1, c0, c1, overlap_box)
+            for r0, r1, c0, c1 in frozen_unknown
+        )
+        if rect is not None
+    ]
+    unknown_area = union_area(unknown_in_overlap)
+
+    # Archived rows for a historical package hold only the wet cells that were
+    # still effective at upgrade time; none lies in an unknown rectangle.
+    known_wet = archived_count(overlap_box)
+    known_dry = overlap_area - unknown_area - known_wet
+
+    # The reported total ``T`` is distributed over the whole package.  Of the
+    # reports hidden in the unknown region, at most ``unknown_outside`` of
+    # them can lie outside the work area, so the rest must be wet inside it.
+    coverage_area = (package["r1"] - package["r0"]) * (
+        package["c1"] - package["c0"]
+    )
+    unknown_total = coverage_area - union_area(frozen_unknown)
+    unknown_outside = unknown_total - (overlap_area - unknown_area)
+    wet_outside = conn.execute(
+        """
+        SELECT COUNT(*) FROM package_wet_archive
+        WHERE package_version = ?
+          AND NOT (row >= ? AND row < ? AND col >= ? AND col < ?)
+        """,
+        (
+            version,
+            overlap_box.row_start,
+            overlap_box.row_end,
+            overlap_box.col_start,
+            overlap_box.col_end,
+        ),
+    ).fetchone()[0]
+    # Archived wet points are knowable, so every un-archived reported point is
+    # somewhere in the unknown region.
+    archived_total = conn.execute(
+        "SELECT COUNT(*) FROM package_wet_archive WHERE package_version = ?",
+        (version,),
+    ).fetchone()[0]
+    reports_in_unknown = listed_total - archived_total
+
+    remaining_reports = listed_total - wet_outside
+    min_wet = known_wet + max(0, reports_in_unknown - unknown_outside)
+    max_wet = known_wet + min(unknown_area, remaining_reports)
+    if min_wet > max_wet:  # defensive only; the data model forbids this
+        min_wet = max_wet
+
+    return _statistics_payload(
+        version=version,
+        box=box,
+        overlap=overlap_box,
+        historical=True,
+        listed_total=listed_total,
+        min_wet=min_wet,
+        max_wet=max_wet,
+        unknown_area=unknown_area,
+        known_dry=known_dry,
+        known_wet=known_wet,
+        unknown_rects=[
+            {
+                "row_start": r0,
+                "row_end": r1,
+                "col_start": c0,
+                "col_end": c1,
+            }
+            for r0, r1, c0, c1 in unknown_in_overlap
+        ],
+        archived=archived,
+        archived_truncated=archived_truncated,
+        reasoning={
+            "wet_outside_intersection": wet_outside,
+            "unknown_outside_intersection": unknown_outside,
+            "reported_points_in_unknown_region": reports_in_unknown,
+            "remaining_reported_points": remaining_reports,
+        },
+    )
+
+
+def _statistics_payload(
+    *,
+    version: int,
+    box: Box,
+    overlap: Box | None,
+    historical: bool,
+    listed_total: int,
+    min_wet: int,
+    max_wet: int,
+    unknown_area: int,
+    known_dry: int,
+    known_wet: int,
+    unknown_rects: list[dict],
+    archived: list[dict],
+    archived_truncated: bool,
+    reasoning: dict | None = None,
+) -> dict:
+    exact = min_wet == max_wet
+    return {
+        "version": version,
+        "box": box.as_dict(),
+        "intersection": overlap.as_dict() if overlap is not None else None,
+        "historical": historical,
+        "listed_wet_total": listed_total,
+        "min_wet": min_wet,
+        "max_wet": max_wet,
+        "exact": exact,
+        "count": min_wet if exact else None,
+        "known_wet": known_wet,
+        "known_dry": known_dry,
+        "unknown_cells": unknown_area,
+        "unknown_rects": unknown_rects,
+        "archived_cells": archived,
+        "archived_truncated": archived_truncated,
+        "reasoning": reasoning or {},
     }

@@ -11,6 +11,7 @@
   --dry-line: #2f5c48;
   --dry-fill: #23463a;
   --unknown: #111a24;
+  --unknown-strong: #3a2f12;
   --ok: #22c55e;
   --warn: #f59e0b;
   --bad: #f43f5e;
@@ -155,7 +156,38 @@ td.num { font-variant-numeric: tabular-nums; }
 .swatch.wet { background: var(--wet); border-color: #ff8b8b; }
 .swatch.surveyed { background: var(--dry-fill); border-color: var(--dry-line); }
 .swatch.unsurveyed { background: var(--unknown); }
+.swatch.unknown-cell { background: var(--unknown-strong); border-color: var(--warn); }
 .swatch.frame { background: transparent; border: 2px dashed var(--accent); }
+
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tag-new { background: #143427; color: #7ee2b0; border: 1px solid #2b6349; }
+.tag-old { background: #2a2310; color: #f2cf87; border: 1px solid #6b4a12; }
+
+select {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+  min-width: 260px;
+}
+select:disabled { opacity: .6; }
+
+#history-map {
+  width: 420px;
+  height: 420px;
+  background: var(--unknown);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  flex: 0 0 auto;
+}
 
 .status-badge {
   display: inline-block;
@@ -179,5 +211,5 @@ footer {
 
 @media (max-width: 720px) {
   header, main, footer { padding-left: 16px; padding-right: 16px; }
-  #map { width: 100%; height: 320px; }
+  #map, #history-map { width: 100%; height: 320px; }
 }

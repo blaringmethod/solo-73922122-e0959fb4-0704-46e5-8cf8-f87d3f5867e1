@@ -12,8 +12,10 @@ from .parsing import MAX_WET_CELLS, PackageError, parse_package
 from .repository import (
     Box,
     ConflictError,
+    PackageNotFoundError,
     cell_status,
     coverage_in_box,
+    historical_box_statistics,
     ingest,
     list_packages,
     query_wet,
@@ -46,6 +48,7 @@ def create_app(config: dict | None = None) -> Flask:
     app.teardown_appcontext(close_db)
     app.register_error_handler(PackageError, _handle_package_error)
     app.register_error_handler(ConflictError, _handle_conflict)
+    app.register_error_handler(PackageNotFoundError, _handle_package_not_found)
     app.register_error_handler(sqlite3.Error, _handle_sqlite_error)
     app.register_error_handler(413, _handle_too_large)
 
@@ -83,6 +86,17 @@ def create_app(config: dict | None = None) -> Flask:
         col = _parse_int_arg("col")
         return jsonify(cell_status(get_db(), row, col))
 
+    @app.get("/api/history/wet")
+    def history_wet():
+        # Historical statistics for one ingested package, restricted to the
+        # intersection of the work-area rectangle and the package's coverage.
+        version = _parse_int_arg("version")
+        if version <= 0:
+            raise PackageError("version 必须是正整数。")
+        box = _parse_box(request.args)
+        limit = _parse_limit(request.args)
+        return jsonify(historical_box_statistics(get_db(), version, box, limit))
+
     @app.get("/api/limits")
     def limits():
         return jsonify(
@@ -103,6 +117,8 @@ def create_app(config: dict | None = None) -> Flask:
         try:
             conn.execute("DELETE FROM current_wet")
             conn.execute("DELETE FROM coverage_rects")
+            conn.execute("DELETE FROM package_wet_archive")
+            conn.execute("DELETE FROM package_unknown_rects")
             conn.execute("DELETE FROM packages")
         except Exception:
             conn.execute("ROLLBACK")
@@ -170,6 +186,20 @@ def _handle_conflict(exc: ConflictError):
             }
         ),
         409,
+    )
+
+
+def _handle_package_not_found(exc: PackageNotFoundError):
+    return (
+        jsonify(
+            {
+                "error": "package_not_found",
+                "message": str(exc),
+                "details": [],
+                "committed": False,
+            }
+        ),
+        404,
     )
 
 

@@ -51,11 +51,12 @@
             <th>覆盖矩形（左闭右开）</th>
             <th>包内积水点</th>
             <th>现行积水点</th>
+            <th>归档积水点 / 类型</th>
             <th>摘要</th>
             <th>入库时间</th>
           </tr>
         </thead>
-        <tbody id="package-rows"><tr><td colspan="6" class="empty">尚无巡查包</td></tr></tbody>
+        <tbody id="package-rows"><tr><td colspan="7" class="empty">尚无巡查包</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -64,8 +65,7 @@
     <div class="card-head">
       <h2>3 · 框查现行积水格</h2>
       <span class="hint">只读取现行状态，不回放历史积水点。</span>
-    </div>
-    <form id="box-form" class="row wrap">
+    </div>    <form id="box-form" class="row wrap">
       <label>行 [start, end)
         <input type="number" name="row_start" value="0" required>
         <input type="number" name="row_end" value="30" required>
@@ -99,7 +99,39 @@
 
   <section class="card">
     <div class="card-head">
-      <h2>4 · 单格查询</h2>
+      <h2>4 · 历史包工区积水复核</h2>
+      <span class="hint">选已入仓版号、填工区矩形，只统计工区与该包覆盖范围的交集。</span>
+    </div>
+    <form id="history-form" class="row wrap">
+      <label>版号
+        <select id="history-version" name="version" required></select>
+      </label>
+      <label>行 [start, end)
+        <input type="number" name="row_start" value="0" required>
+        <input type="number" name="row_end" value="30" required>
+      </label>
+      <label>列 [start, end)
+        <input type="number" name="col_start" value="0" required>
+        <input type="number" name="col_end" value="30" required>
+      </label>
+      <button type="submit">复核</button>
+    </form>
+    <p id="history-summary" class="hint"></p>
+    <div class="map-wrap">
+      <svg id="history-map" viewBox="0 0 100 100" role="img" aria-label="历史复核地图"></svg>
+      <div class="legend">
+        <span><i class="swatch wet"></i>已知积水（归档/升级时快照）</span>
+        <span><i class="swatch surveyed"></i>已知干（升级时已确定）</span>
+        <span><i class="swatch unknown-cell"></i>未知（升级时被高版覆盖）</span>
+        <span><i class="swatch frame"></i>工区与覆盖的交集边界</span>
+      </div>
+    </div>
+    <div id="history-result" class="result" hidden></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>5 · 单格查询</h2>
       <span class="hint">显示：有积水 / 已查无积水 / 未巡查。</span>
     </div>
     <form id="cell-form" class="row wrap">
